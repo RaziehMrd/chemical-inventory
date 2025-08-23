@@ -27,30 +27,26 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 # Prefer cloud DB if provided; otherwise use a disk-backed SQLite path.
 DB_URL = (os.environ.get("DATABASE_URL") or "").strip()
 
-def _sqlite_url():
+def _sqlite_url() -> str:
     """Return an absolute SQLite URL under a guaranteed-writable path."""
     data_dir = os.environ.get("DATA_DIR", "/opt/render/project/src/data")
     try:
         os.makedirs(data_dir, exist_ok=True)
     except Exception:
-        # Fallback to /tmp if the preferred path isn't writable
         data_dir = "/tmp"
         os.makedirs(data_dir, exist_ok=True)
     abs_path = os.path.join(data_dir, "lab_inventory.db")
-    # Absolute path form for SQLAlchemy/SQLite is 'sqlite:////abs/path'
     return "sqlite:////" + abs_path.lstrip("/")
 
 def _normalize_db_url(url: str) -> str:
-    """Ensure Postgres URLs have sslmode when required; passthrough others."""
+    """Ensure Postgres URLs are compatible; add sslmode when missing."""
     if not url:
         return _sqlite_url()
     low = url.lower()
     if low.startswith("postgres://"):
-        # SQLAlchemy prefers 'postgresql://' scheme
         url = "postgresql://" + url[len("postgres://"):]
         low = url.lower()
     if low.startswith("postgresql://") and "sslmode=" not in low:
-        # Many providers (Render, Supabase) require sslmode
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}sslmode=require"
     return url
@@ -80,8 +76,11 @@ class Request(Base):
     __tablename__ = "requests"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chem_id: Mapped[int] = mapped_column(ForeignKey("chemicals.id"), nullable=False)
-    first_name: Mapped[str] = mapped_column(String, nullable=False)   # NEW
-    surname: Mapped[str] = mapped_column(String, nullable=False)      # NEW
+
+    # New columns (ensure they also exist in your existing DB via ALTER TABLE)
+    first_name: Mapped[str] = mapped_column(String, nullable=False, default="")  # NEW
+    surname: Mapped[str] = mapped_column(String, nullable=False, default="")     # NEW
+
     requester_email: Mapped[str] = mapped_column(String, nullable=False)
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
@@ -93,7 +92,6 @@ class Request(Base):
 # =============================
 # Engine & table creation
 # =============================
-# For SQLite, allow multi-threaded access in Streamlit by disabling same-thread check.
 connect_args = {}
 if DB_URL.startswith("sqlite:"):
     connect_args["check_same_thread"] = False
@@ -149,8 +147,8 @@ def add_request(chem_id: int, first_name: str, surname: str, email: str, qty: fl
     with Session(engine) as sess:
         req = Request(
             chem_id=int(chem_id),
-            first_name=first_name.strip(),   # NEW
-            surname=surname.strip(),         # NEW
+            first_name=first_name.strip(),
+            surname=surname.strip(),
             requester_email=email.strip(),
             quantity=float(qty),
             status="pending",
@@ -163,16 +161,32 @@ def list_requests(status: str | None = None):
     with Session(engine) as sess:
         if status:
             stmt = text("""
-                SELECT r.id, c.name, r.quantity, r.requester_email, r.status, r.created_at
-                FROM requests r JOIN chemicals c ON r.chem_id = c.id
+                SELECT r.id,
+                       c.name,
+                       r.quantity,
+                       r.first_name,
+                       r.surname,
+                       r.requester_email,
+                       r.status,
+                       r.created_at
+                FROM requests r
+                JOIN chemicals c ON r.chem_id = c.id
                 WHERE r.status = :status
                 ORDER BY r.id DESC
             """)
             rows = sess.execute(stmt, {"status": status}).all()
         else:
             stmt = text("""
-                SELECT r.id, c.name, r.quantity, r.requester_email, r.status, r.created_at
-                FROM requests r JOIN chemicals c ON r.chem_id = c.id
+                SELECT r.id,
+                       c.name,
+                       r.quantity,
+                       r.first_name,
+                       r.surname,
+                       r.requester_email,
+                       r.status,
+                       r.created_at
+                FROM requests r
+                JOIN chemicals c ON r.chem_id = c.id
                 ORDER BY r.id DESC
             """)
             rows = sess.execute(stmt).all()
@@ -221,8 +235,8 @@ with tabs[0]:
         with st.form("request_form"):
             chosen = st.selectbox("Choose chemical", options=list(chem_options.keys()))
             qty = st.number_input("Quantity needed", min_value=0.0, step=0.1, format="%.3f")
-            first_name = st.text_input("First Name")       
-            surname = st.text_input("Surname")             
+            first_name = st.text_input("First Name")
+            surname = st.text_input("Surname")
             email = st.text_input("Your email")
             submitted = st.form_submit_button("Submit request")
 
@@ -236,8 +250,6 @@ with tabs[0]:
             else:
                 add_request(chem_options[chosen], first_name, surname, email, qty)
                 st.success("Request submitted! The lab admin will review it.")
-        
-        
 
 # --- Admin
 with tabs[1]:
@@ -328,10 +340,10 @@ Ethanol,1,L,Flammables Cabinet,96%"""
     st.markdown("### Pending requests")
     reqs = list_requests(status="pending")
     if reqs:
-        for rid, cname, qty, remail, status, created in reqs:
+        for rid, cname, qty, fname, sname, remail, status, created in reqs:
             with st.container(border=True):
                 st.write(f"**[{rid}] {cname}** — requested: **{qty}**")
-                st.write(f"Requester: {first_name} {surname} ({remail}) • Created: {created} • Status: {status}")
+                st.write(f"Requester: {fname} {sname} ({remail}) • Created: {created} • Status: {status}")
 
                 c1, c2, c3 = st.columns(3)
                 with c1:
@@ -358,13 +370,13 @@ Ethanol,1,L,Flammables Cabinet,96%"""
                     "ID": rid,
                     "Chemical": cname,
                     "Qty": qty,
-                    "First Name": fname,   # NEW
-                    "Surname": sname,      # NEW
+                    "First Name": fname,
+                    "Surname": sname,
                     "Requester": remail,
                     "Status": status,
                     "Created": str(created),
                 }
-                for rid, cname, qty, remail, status, created in all_reqs
+                for rid, cname, qty, fname, sname, remail, status, created in all_reqs
             ],
             use_container_width=True,
         )
