@@ -4,24 +4,62 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, String,
-                        create_engine, func, select, text)
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    create_engine,
+    func,
+    select,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, relationship
+
 
 # =============================
 # Config
 # =============================
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
-# If DATABASE_URL is not set, default to a SQLite file in ./data (good for Render/Railway disks)
-DB_URL = os.environ.get("DATABASE_URL", "sqlite:///data/lab_inventory.db")
+# Prefer cloud DB if provided; otherwise use a disk-backed SQLite path.
+DB_URL = (os.environ.get("DATABASE_URL") or "").strip()
 
-# For some managed Postgres (e.g., Render) you may need SSL; SQLAlchemy can accept connect args via URI params.
-# Example: append "?sslmode=require" if your provider requires it:
-# DB_URL = DB_URL + ("?sslmode=require" if DB_URL.startswith("postgres") and "sslmode" not in DB_URL else "")
+def _sqlite_url():
+    """Return an absolute SQLite URL under a guaranteed-writable path."""
+    data_dir = os.environ.get("DATA_DIR", "/opt/render/project/src/data")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception:
+        # Fallback to /tmp if the preferred path isn't writable
+        data_dir = "/tmp"
+        os.makedirs(data_dir, exist_ok=True)
+    abs_path = os.path.join(data_dir, "lab_inventory.db")
+    # Absolute path form for SQLAlchemy/SQLite is 'sqlite:////abs/path'
+    return "sqlite:////" + abs_path.lstrip("/")
+
+def _normalize_db_url(url: str) -> str:
+    """Ensure Postgres URLs have sslmode when required; passthrough others."""
+    if not url:
+        return _sqlite_url()
+    low = url.lower()
+    if low.startswith("postgres://"):
+        # SQLAlchemy prefers 'postgresql://' scheme
+        url = "postgresql://" + url[len("postgres://"):]
+        low = url.lower()
+    if low.startswith("postgresql://") and "sslmode=" not in low:
+        # Many providers (Render, Supabase) require sslmode
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+    return url
+
+DB_URL = _normalize_db_url(DB_URL)
+
 
 # =============================
-# DB models (SQLAlchemy 2.x)
+# SQLAlchemy models (2.x style)
 # =============================
 class Base(DeclarativeBase):
     pass
@@ -34,7 +72,9 @@ class Chemical(Base):
     unit: Mapped[str] = mapped_column(String, default="g", nullable=False)
     location: Mapped[str] = mapped_column(String, default="")
     notes: Mapped[str] = mapped_column(String, default="")
-    requests: Mapped[list["Request"]] = relationship(back_populates="chemical", cascade="all, delete")
+    requests: Mapped[list["Request"]] = relationship(
+        back_populates="chemical", cascade="all, delete-orphan"
+    )
 
 class Request(Base):
     __tablename__ = "requests"
@@ -47,9 +87,18 @@ class Request(Base):
 
     chemical: Mapped[Chemical] = relationship(back_populates="requests")
 
-# Engine & tables
-engine = create_engine(DB_URL, echo=False, future=True)
+
+# =============================
+# Engine & table creation
+# =============================
+# For SQLite, allow multi-threaded access in Streamlit by disabling same-thread check.
+connect_args = {}
+if DB_URL.startswith("sqlite:"):
+    connect_args["check_same_thread"] = False
+
+engine = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, pool_pre_ping=True)
 Base.metadata.create_all(engine)
+
 
 # =============================
 # CRUD helpers
@@ -57,12 +106,16 @@ Base.metadata.create_all(engine)
 def list_chemicals(search: str = ""):
     with Session(engine) as sess:
         if search:
-            stmt = select(Chemical.id, Chemical.name, Chemical.amount, Chemical.unit, Chemical.location)\
-                .where(Chemical.name.ilike(f"%{search}%"))\
+            stmt = (
+                select(Chemical.id, Chemical.name, Chemical.amount, Chemical.unit, Chemical.location)
+                .where(Chemical.name.ilike(f"%{search}%"))
                 .order_by(Chemical.name.asc())
+            )
         else:
-            stmt = select(Chemical.id, Chemical.name, Chemical.amount, Chemical.unit, Chemical.location)\
+            stmt = (
+                select(Chemical.id, Chemical.name, Chemical.amount, Chemical.unit, Chemical.location)
                 .order_by(Chemical.name.asc())
+            )
         return sess.execute(stmt).all()
 
 def upsert_chemical(name: str, amount: float, unit: str, location: str, notes: str = ""):
@@ -129,6 +182,7 @@ def set_request_status(req_id: int, new_status: str):
         req.status = new_status
         sess.commit()
 
+
 # =============================
 # UI
 # =============================
@@ -141,7 +195,8 @@ tabs = st.tabs(["Search & Request", "Admin"])
 with tabs[0]:
     st.subheader("Search inventory")
     q = st.text_input("Search by chemical name", placeholder="e.g., acetone, ethanol, NaCl")
-    data = list_chemicals(q.lower().strip() if q else "")
+    q_norm = q.lower().strip() if q else ""
+    data = list_chemicals(q_norm)
 
     if data:
         st.write("#### Available chemicals")
@@ -303,4 +358,3 @@ Ethanol,1,L,Flammables Cabinet,96%"""
         )
     else:
         st.info("No requests yet.")
-
