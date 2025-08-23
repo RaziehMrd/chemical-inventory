@@ -80,6 +80,8 @@ class Request(Base):
     __tablename__ = "requests"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chem_id: Mapped[int] = mapped_column(ForeignKey("chemicals.id"), nullable=False)
+    first_name: Mapped[str] = mapped_column(String, nullable=False)   # NEW
+    surname: Mapped[str] = mapped_column(String, nullable=False)      # NEW
     requester_email: Mapped[str] = mapped_column(String, nullable=False)
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
@@ -143,10 +145,12 @@ def update_stock(chem_id: int, delta_amount: float):
         chem.amount = float(chem.amount) + float(delta_amount)
         sess.commit()
 
-def add_request(chem_id: int, email: str, qty: float):
+def add_request(chem_id: int, first_name: str, surname: str, email: str, qty: float):
     with Session(engine) as sess:
         req = Request(
             chem_id=int(chem_id),
+            first_name=first_name.strip(),   # NEW
+            surname=surname.strip(),         # NEW
             requester_email=email.strip(),
             quantity=float(qty),
             status="pending",
@@ -217,17 +221,23 @@ with tabs[0]:
         with st.form("request_form"):
             chosen = st.selectbox("Choose chemical", options=list(chem_options.keys()))
             qty = st.number_input("Quantity needed", min_value=0.0, step=0.1, format="%.3f")
+            first_name = st.text_input("First Name")       
+            surname = st.text_input("Surname")             
             email = st.text_input("Your email")
             submitted = st.form_submit_button("Submit request")
 
         if submitted:
             if qty <= 0:
                 st.error("Quantity must be > 0.")
+            elif not first_name.strip() or not surname.strip():
+                st.error("Please enter both first name and surname.")
             elif "@" not in email or "." not in email:
                 st.error("Please enter a valid email.")
             else:
-                add_request(chem_options[chosen], email, qty)
+                add_request(chem_options[chosen], first_name, surname, email, qty)
                 st.success("Request submitted! The lab admin will review it.")
+        
+        
 
 # --- Admin
 with tabs[1]:
@@ -321,7 +331,7 @@ Ethanol,1,L,Flammables Cabinet,96%"""
         for rid, cname, qty, remail, status, created in reqs:
             with st.container(border=True):
                 st.write(f"**[{rid}] {cname}** — requested: **{qty}**")
-                st.write(f"Requester: {remail} • Created: {created} • Status: {status}")
+                st.write(f"Requester: {first_name} {surname} ({remail}) • Created: {created} • Status: {status}")
 
                 c1, c2, c3 = st.columns(3)
                 with c1:
@@ -348,6 +358,8 @@ Ethanol,1,L,Flammables Cabinet,96%"""
                     "ID": rid,
                     "Chemical": cname,
                     "Qty": qty,
+                    "First Name": fname,   # NEW
+                    "Surname": sname,      # NEW
                     "Requester": remail,
                     "Status": status,
                     "Created": str(created),
