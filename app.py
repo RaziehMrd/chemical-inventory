@@ -1,20 +1,11 @@
 # app.py
 import os
 from datetime import datetime
-
 import pandas as pd
 import streamlit as st
 from sqlalchemy import (
-    Column,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    String,
-    create_engine,
-    func,
-    select,
-    text,
+    Column, DateTime, Float, ForeignKey, Integer, String,
+    create_engine, func, select, text
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, relationship
 
@@ -22,23 +13,15 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, rela
 # Config
 # =============================
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
-
-# Prefer cloud DB if provided; otherwise use a disk-backed SQLite path.
 DB_URL = (os.environ.get("DATABASE_URL") or "").strip()
 
 def _sqlite_url() -> str:
-    """Return an absolute SQLite URL under a guaranteed-writable path."""
     data_dir = os.environ.get("DATA_DIR", "/opt/render/project/src/data")
-    try:
-        os.makedirs(data_dir, exist_ok=True)
-    except Exception:
-        data_dir = "/tmp"
-        os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
     abs_path = os.path.join(data_dir, "lab_inventory.db")
     return "sqlite:////" + abs_path.lstrip("/")
 
 def _normalize_db_url(url: str) -> str:
-    """Ensure Postgres URLs are compatible; add sslmode when missing."""
     if not url:
         return _sqlite_url()
     low = url.lower()
@@ -53,7 +36,7 @@ def _normalize_db_url(url: str) -> str:
 DB_URL = _normalize_db_url(DB_URL)
 
 # =============================
-# SQLAlchemy models (2.x style)
+# Models
 # =============================
 class Base(DeclarativeBase):
     pass
@@ -66,32 +49,21 @@ class Chemical(Base):
     unit: Mapped[str] = mapped_column(String, default="g", nullable=False)
     location: Mapped[str] = mapped_column(String, default="")
     notes: Mapped[str] = mapped_column(String, default="")
-    requests: Mapped[list["Request"]] = relationship(
-        back_populates="chemical", cascade="all, delete-orphan"
-    )
+    requests: Mapped[list["Request"]] = relationship(back_populates="chemical", cascade="all, delete-orphan")
 
 class Request(Base):
     __tablename__ = "requests"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chem_id: Mapped[int] = mapped_column(ForeignKey("chemicals.id"), nullable=False)
-
-    # Ensure these columns exist in your existing DB (ALTER TABLE done earlier)
     first_name: Mapped[str] = mapped_column(String, nullable=False, default="")
     surname: Mapped[str] = mapped_column(String, nullable=False, default="")
-
     requester_email: Mapped[str] = mapped_column(String, nullable=False)
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
-
     chemical: Mapped[Chemical] = relationship(back_populates="requests")
 
 class PurchaseRequest(Base):
-    """
-    For "not found in search" purchases.
-    Required fields: material_name, cas_number, specifications, amount, unit
-    Optional: comments, requester_first_name, requester_surname, requester_email
-    """
     __tablename__ = "purchase_requests"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     material_name: Mapped[str] = mapped_column(String, nullable=False)
@@ -100,136 +72,30 @@ class PurchaseRequest(Base):
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     unit: Mapped[str] = mapped_column(String, nullable=False)
 
-    comments: Mapped[str] = mapped_column(String, default="")  # optional
-    requester_first_name: Mapped[str] = mapped_column(String, default="")  # optional
-    requester_surname: Mapped[str] = mapped_column(String, default="")     # optional
-    requester_email: Mapped[str] = mapped_column(String, default="")       # optional
+    # Now required:
+    requester_first_name: Mapped[str] = mapped_column(String, nullable=False)
+    requester_surname: Mapped[str] = mapped_column(String, nullable=False)
+    requester_email: Mapped[str] = mapped_column(String, nullable=False)
+
+    comments: Mapped[str] = mapped_column(String, default="")
 
     status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
 
 # =============================
-# Engine & table creation
+# Engine
 # =============================
 connect_args = {}
 if DB_URL.startswith("sqlite:"):
     connect_args["check_same_thread"] = False
-
 engine = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, pool_pre_ping=True)
 Base.metadata.create_all(engine)
 
 # =============================
 # CRUD helpers
 # =============================
-def list_chemicals(search: str = ""):
-    with Session(engine) as sess:
-        if search:
-            stmt = (
-                select(Chemical.id, Chemical.name, Chemical.amount, Chemical.unit, Chemical.location)
-                .where(Chemical.name.ilike(f"%{search}%"))
-                .order_by(Chemical.name.asc())
-            )
-        else:
-            stmt = (
-                select(Chemical.id, Chemical.name, Chemical.amount, Chemical.unit, Chemical.location)
-                .order_by(Chemical.name.asc())
-            )
-        return sess.execute(stmt).all()
-
-def upsert_chemical(name: str, amount: float, unit: str, location: str, notes: str = ""):
-    name = name.strip()
-    unit = unit.strip()
-    location = location.strip()
-    notes = notes.strip()
-    with Session(engine) as sess:
-        chem = sess.scalar(select(Chemical).where(Chemical.name == name))
-        if chem is None:
-            chem = Chemical(name=name, amount=float(amount), unit=unit, location=location, notes=notes)
-            sess.add(chem)
-        else:
-            chem.amount = float(amount)
-            chem.unit = unit
-            chem.location = location
-            chem.notes = notes
-        sess.commit()
-
-def update_stock(chem_id: int, delta_amount: float):
-    with Session(engine) as sess:
-        chem = sess.get(Chemical, int(chem_id))
-        if chem is None:
-            raise ValueError("Chemical not found")
-        chem.amount = float(chem.amount) + float(delta_amount)
-        sess.commit()
-
-def add_request(chem_id: int, first_name: str, surname: str, email: str, qty: float):
-    with Session(engine) as sess:
-        req = Request(
-            chem_id=int(chem_id),
-            first_name=first_name.strip(),
-            surname=surname.strip(),
-            requester_email=email.strip(),
-            quantity=float(qty),
-            status="pending",
-            created_at=datetime.utcnow(),
-        )
-        sess.add(req)
-        sess.commit()
-
-def list_requests(status: str | None = None):
-    with Session(engine) as sess:
-        if status:
-            stmt = text("""
-                SELECT r.id,
-                       c.name,
-                       r.quantity,
-                       r.first_name,
-                       r.surname,
-                       r.requester_email,
-                       r.status,
-                       r.created_at
-                FROM requests r
-                JOIN chemicals c ON r.chem_id = c.id
-                WHERE r.status = :status
-                ORDER BY r.id DESC
-            """)
-            rows = sess.execute(stmt, {"status": status}).all()
-        else:
-            stmt = text("""
-                SELECT r.id,
-                       c.name,
-                       r.quantity,
-                       r.first_name,
-                       r.surname,
-                       r.requester_email,
-                       r.status,
-                       r.created_at
-                FROM requests r
-                JOIN chemicals c ON r.chem_id = c.id
-                ORDER BY r.id DESC
-            """)
-            rows = sess.execute(stmt).all()
-        return rows
-
-def set_request_status(req_id: int, new_status: str):
-    with Session(engine) as sess:
-        req = sess.get(Request, int(req_id))
-        if req is None:
-            return
-        req.status = new_status
-        sess.commit()
-
-# --- Purchase request helpers
-def add_purchase_request(
-    material_name: str,
-    cas_number: str,
-    specifications: str,
-    amount: float,
-    unit: str,
-    comments: str = "",
-    requester_first_name: str = "",
-    requester_surname: str = "",
-    requester_email: str = "",
-):
+def add_purchase_request(material_name, cas_number, specifications, amount, unit,
+                         requester_first_name, requester_surname, requester_email, comments=""):
     with Session(engine) as sess:
         pr = PurchaseRequest(
             material_name=material_name.strip(),
@@ -237,10 +103,10 @@ def add_purchase_request(
             specifications=specifications.strip(),
             amount=float(amount),
             unit=unit.strip(),
-            comments=comments.strip(),
             requester_first_name=requester_first_name.strip(),
             requester_surname=requester_surname.strip(),
             requester_email=requester_email.strip(),
+            comments=comments.strip(),
             status="pending",
             created_at=datetime.utcnow(),
         )
@@ -251,331 +117,85 @@ def list_purchase_requests(status: str | None = None):
     with Session(engine) as sess:
         if status:
             stmt = text("""
-                SELECT id,
-                       material_name,
-                       cas_number,
-                       specifications,
-                       amount,
-                       unit,
-                       requester_first_name,
-                       requester_surname,
-                       requester_email,
-                       comments,
-                       status,
-                       created_at
+                SELECT id, material_name, cas_number, specifications, amount, unit,
+                       requester_first_name, requester_surname, requester_email,
+                       comments, status, created_at
                 FROM purchase_requests
                 WHERE status = :status
                 ORDER BY id DESC
             """)
-            rows = sess.execute(stmt, {"status": status}).all()
+            return sess.execute(stmt, {"status": status}).all()
         else:
             stmt = text("""
-                SELECT id,
-                       material_name,
-                       cas_number,
-                       specifications,
-                       amount,
-                       unit,
-                       requester_first_name,
-                       requester_surname,
-                       requester_email,
-                       comments,
-                       status,
-                       created_at
+                SELECT id, material_name, cas_number, specifications, amount, unit,
+                       requester_first_name, requester_surname, requester_email,
+                       comments, status, created_at
                 FROM purchase_requests
                 ORDER BY id DESC
             """)
-            rows = sess.execute(stmt).all()
-        return rows
+            return sess.execute(stmt).all()
 
 def set_purchase_request_status(req_id: int, new_status: str):
     with Session(engine) as sess:
         pr = sess.get(PurchaseRequest, int(req_id))
-        if pr is None:
-            return
-        pr.status = new_status
-        sess.commit()
+        if pr:
+            pr.status = new_status
+            sess.commit()
 
 # =============================
-# UI
+# UI (only changed part shown)
 # =============================
 st.set_page_config(page_title="Lab Chemicals", page_icon="🧪", layout="wide")
 st.title("🧪 Lab Chemical Inventory")
 
 tabs = st.tabs(["Search & Request", "Admin"])
 
-# --- Search & Request
 with tabs[0]:
     st.subheader("Search inventory")
     q = st.text_input("Search by chemical name", placeholder="e.g., acetone, ethanol, NaCl")
     q_norm = q.lower().strip() if q else ""
-    data = list_chemicals(q_norm)
+    data = []  # (replace with your list_chemicals function call)
 
-    if data:
-        st.write("#### Available chemicals")
-        st.dataframe(
-            [{"ID": r[0], "Chemical": r[1], "Amount": r[2], "Unit": r[3], "Location": r[4]} for r in data],
-            use_container_width=True,
-        )
-    else:
+    if not data:
         st.info("No chemicals match your search.")
-
-        # -------- Request Purchase (appears only when search has no results) --------
-        st.markdown(
-            "<div style='margin-top: 1rem; font-weight:600;'>Request to purchase this material</div>",
-            unsafe_allow_html=True,
-        )
         st.markdown("<span style='color:red;font-weight:700;'>★</span> Required fields", unsafe_allow_html=True)
 
-        req_tab_required, req_tab_optional = st.tabs(["Required ★", "Optional (Comments & Contact)"])
+        req_tab_required, req_tab_optional = st.tabs(["Required ★", "Optional (Comments)"])
 
         with req_tab_required:
-            with st.form("purchase_required_form", clear_on_submit=False):
+            with st.form("purchase_required_form"):
                 col1, col2 = st.columns(2)
                 with col1:
                     material_name = st.text_input("Material name ★")
-                    cas_number = st.text_input("CAS number ★", placeholder="e.g., 64-17-5")
+                    cas_number = st.text_input("CAS number ★")
                     amount = st.number_input("Amount ★", min_value=0.0, step=0.1, format="%.3f")
+                    requester_first_name = st.text_input("First Name ★")
+                    requester_surname = st.text_input("Surname ★")
                 with col2:
-                    specifications = st.text_area("Specifications ★", placeholder="Grade, purity, supplier preference, size, etc.", height=110)
+                    specifications = st.text_area("Specifications ★", height=100)
                     unit = st.selectbox("Unit ★", ["g", "mg", "kg", "mL", "L", "other"])
-
-                submit_required = st.form_submit_button("Continue to Optional")
+                    requester_email = st.text_input("Email ★")
+                submit_required = st.form_submit_button("Submit purchase request")
 
         with req_tab_optional:
-            with st.form("purchase_optional_form"):
-                comments = st.text_area("Comments (optional)", placeholder="Any extra details, budget code, delivery notes, etc.", height=100)
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    requester_first_name = st.text_input("First name (optional)")
-                with c2:
-                    requester_surname = st.text_input("Surname (optional)")
-                with c3:
-                    requester_email = st.text_input("Email (optional)")
-                submit_purchase = st.form_submit_button("Submit purchase request")
+            comments = st.text_area("Comments (optional)", height=100)
 
-        # Validate and submit (requires required form to be filled at least once)
-        if "material_name" in locals() and submit_purchase:
+        if submit_required:
             errs = []
-            if not material_name.strip():
-                errs.append("Material name")
-            if not cas_number.strip():
-                errs.append("CAS number")
-            if not specifications.strip():
-                errs.append("Specifications")
-            if amount <= 0:
-                errs.append("Amount")
-            if not unit:
-                errs.append("Unit")
+            if not material_name.strip(): errs.append("Material name")
+            if not cas_number.strip(): errs.append("CAS number")
+            if not specifications.strip(): errs.append("Specifications")
+            if amount <= 0: errs.append("Amount")
+            if not unit: errs.append("Unit")
+            if not requester_first_name.strip(): errs.append("First Name")
+            if not requester_surname.strip(): errs.append("Surname")
+            if not requester_email.strip(): errs.append("Email")
 
             if errs:
                 st.error("Please fill all required fields (★): " + ", ".join(errs))
             else:
-                try:
-                    add_purchase_request(
-                        material_name=material_name,
-                        cas_number=cas_number,
-                        specifications=specifications,
-                        amount=amount,
-                        unit=unit,
-                        comments=comments if "comments" in locals() else "",
-                        requester_first_name=requester_first_name if "requester_first_name" in locals() else "",
-                        requester_surname=requester_surname if "requester_surname" in locals() else "",
-                        requester_email=requester_email if "requester_email" in locals() else "",
-                    )
-                    st.success("Purchase request submitted! The lab admin will review it.")
-                except Exception as e:
-                    st.error(f"Failed to submit purchase request: {e}")
+                add_purchase_request(material_name, cas_number, specifications, amount, unit,
+                                     requester_first_name, requester_surname, requester_email,
+                                     comments if "comments" in locals() else "")
+                st.success("Purchase request submitted! The lab admin will review it.")
 
-    # -------- Regular request flow (for in-stock chemicals) --------
-    if data:
-        st.markdown("---")
-        st.subheader("Request a chemical (in stock)")
-        chem_options = {f"{name} ({amount} {unit})": cid for cid, name, amount, unit, _loc in data} if data else {}
-        if not chem_options:
-            st.warning("No chemicals to request yet. Please ask an admin to add items.")
-        else:
-            with st.form("request_form"):
-                chosen = st.selectbox("Choose chemical", options=list(chem_options.keys()))
-                qty = st.number_input("Quantity needed", min_value=0.0, step=0.1, format="%.3f")
-                first_name = st.text_input("First Name")
-                surname = st.text_input("Surname")
-                email = st.text_input("Your email")
-                submitted = st.form_submit_button("Submit request")
-
-            if submitted:
-                if qty <= 0:
-                    st.error("Quantity must be > 0.")
-                elif not first_name.strip() or not surname.strip():
-                    st.error("Please enter both first name and surname.")
-                elif "@" not in email or "." not in email:
-                    st.error("Please enter a valid email.")
-                else:
-                    add_request(chem_options[chosen], first_name, surname, email, qty)
-                    st.success("Request submitted! The lab admin will review it.")
-
-# --- Admin
-with tabs[1]:
-    st.subheader("Admin")
-    pw = st.text_input("Admin password", type="password", placeholder="Enter admin password")
-    if pw != ADMIN_PASSWORD:
-        st.warning("Enter the correct password to manage inventory.")
-        st.stop()
-
-    st.success("Admin mode enabled.")
-
-    # Add / Update chemical
-    with st.expander("➕ Add / Update a chemical", expanded=False):
-        with st.form("add_chem"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                name = st.text_input("Chemical name")
-                unit = st.text_input("Unit", value="g")
-            with col2:
-                amount = st.number_input("Amount", min_value=0.0, step=0.1)
-            with col3:
-                location = st.text_input("Location", value="")
-            notes = st.text_area("Notes (optional)", height=80)
-            add_btn = st.form_submit_button("Save")
-        if add_btn:
-            if not name.strip():
-                st.error("Name is required.")
-            else:
-                try:
-                    upsert_chemical(name, amount, unit, location, notes)
-                    st.success(f"Saved “{name}”.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-
-    # Bulk CSV Import
-    with st.expander("📥 Bulk import from CSV (Name,Amount,Unit,Location,Notes)", expanded=False):
-        tmpl = """Name,Amount,Unit,Location,Notes
-Acetone,2.5,L,Flammables Cabinet,ACS grade
-Sodium chloride,500,g,Main Shelf,A.R.
-Ethanol,1,L,Flammables Cabinet,96%"""
-        st.caption("Expected columns: Name, Amount, Unit, Location, (optional) Notes")
-        st.code(tmpl, language="csv")
-
-        file = st.file_uploader("Upload CSV file", type=["csv"])
-        if file is not None:
-            try:
-                df = pd.read_csv(file)
-                required = {"Name", "Amount", "Unit", "Location"}
-                if not required.issubset(set(df.columns)):
-                    st.error(f"CSV must contain columns: {', '.join(sorted(required))}")
-                else:
-                    st.write("Preview:")
-                    st.dataframe(df, use_container_width=True)
-                    if st.button("Import rows"):
-                        ok, err = 0, 0
-                        for _, row in df.iterrows():
-                            try:
-                                upsert_chemical(
-                                    name=str(row["Name"]),
-                                    amount=float(row["Amount"]),
-                                    unit=str(row["Unit"]),
-                                    location=str(row["Location"]),
-                                    notes=str(row.get("Notes", "")),
-                                )
-                                ok += 1
-                            except Exception:
-                                err += 1
-                        st.success(f"Imported {ok} rows. Errors: {err}.")
-            except Exception as e:
-                st.error(f"Failed to read CSV: {e}")
-
-    # Adjust stock
-    with st.expander("🔧 Adjust stock", expanded=False):
-        all_chems = list_chemicals("")
-        if not all_chems:
-            st.info("No chemicals yet.")
-        else:
-            label_to_id = {f"{n} ({a} {u}) [ID:{cid}]": cid for cid, n, a, u, _ in all_chems}
-            sel = st.selectbox("Select chemical", list(label_to_id.keys()))
-            delta = st.number_input("Change in amount (use negative to reduce)", step=0.1, format="%.3f")
-            if st.button("Apply change"):
-                try:
-                    update_stock(label_to_id[sel], delta)
-                    st.success("Stock updated.")
-                except Exception as e:
-                    st.error(f"Error updating stock: {e}")
-
-    # Pending in-stock requests
-    st.markdown("### Pending in-stock requests")
-    reqs = list_requests(status="pending")
-    if reqs:
-        for rid, cname, qty, fname, sname, remail, status, created in reqs:
-            with st.container(border=True):
-                st.write(f"**[{rid}] {cname}** — requested: **{qty}**")
-                st.write(f"Requester: {fname} {sname} ({remail}) • Created: {created} • Status: {status}")
-
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    if st.button("Approve", key=f"approve_{rid}"):
-                        set_request_status(rid, "approved")
-                        st.success("Approved.")
-                with c2:
-                    if st.button("Reject", key=f"reject_{rid}"):
-                        set_request_status(rid, "rejected")
-                        st.info("Rejected.")
-                with c3:
-                    if st.button("Mark Fulfilled", key=f"fulfill_{rid}"):
-                        set_request_status(rid, "fulfilled")
-                        st.success("Fulfilled.")
-    else:
-        st.info("No pending in-stock requests.")
-
-    # Purchase requests
-    st.markdown("### Pending purchase requests")
-    pending_purchases = list_purchase_requests(status="pending")
-    if pending_purchases:
-        for (pid, mname, cas, specs, amt, unit, pfname, psname, pmail, pcomments, pstatus, pcreated) in pending_purchases:
-            with st.container(border=True):
-                st.write(f"**[{pid}] {mname}** — {amt} {unit} • CAS: {cas}")
-                st.write(f"Specifications: {specs}")
-                contact = f"{(pfname + ' ' + psname).strip()} ({pmail})".strip() if (pfname or psname or pmail) else "—"
-                st.write(f"Requester: {contact} • Created: {pcreated} • Status: {pstatus}")
-                if pcomments:
-                    st.caption(f"Comments: {pcomments}")
-
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    if st.button("Approve purchase", key=f"papprove_{pid}"):
-                        set_purchase_request_status(pid, "approved")
-                        st.success("Purchase request approved.")
-                with c2:
-                    if st.button("Reject purchase", key=f"preject_{pid}"):
-                        set_purchase_request_status(pid, "rejected")
-                        st.info("Purchase request rejected.")
-                with c3:
-                    if st.button("Mark Purchased", key=f"pfulfill_{pid}"):
-                        set_purchase_request_status(pid, "purchased")
-                        st.success("Marked as purchased.")
-    else:
-        st.info("No pending purchase requests.")
-
-    st.markdown("### All purchase requests")
-    all_purchases = list_purchase_requests()
-    if all_purchases:
-        st.dataframe(
-            [
-                {
-                    "ID": pid,
-                    "Material": mname,
-                    "CAS": cas,
-                    "Specs": specs,
-                    "Amount": amt,
-                    "Unit": unit,
-                    "First Name": pfname,
-                    "Surname": psname,
-                    "Email": pmail,
-                    "Comments": pcomments,
-                    "Status": pstatus,
-                    "Created": str(pcreated),
-                }
-                for (pid, mname, cas, specs, amt, unit, pfname, psname, pmail, pcomments, pstatus, pcreated) in all_purchases
-            ],
-            use_container_width=True,
-        )
-    else:
-        st.info("No purchase requests yet.")
