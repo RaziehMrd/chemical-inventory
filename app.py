@@ -254,10 +254,43 @@ def set_purchase_request_status(req_id: int, new_status: str):
             pr.status = new_status
             sess.commit()
 
+# ---- New: Approve & deduct stock for in-stock requests ----
+def approve_request_and_adjust(req_id: int):
+    """Approve an in-stock request and deduct the requested quantity from inventory.
+       Safe-guards:
+         - Avoid double-deduct if already approved/fulfilled.
+         - Validate sufficient stock and positive request quantity.
+    """
+    with Session(engine) as sess:
+        req = sess.get(Request, int(req_id))
+        if req is None:
+            return False, "Request not found."
+
+        if req.status in ("approved", "fulfilled"):
+            return False, f"Request already {req.status}; no stock changed."
+
+        chem = sess.get(Chemical, int(req.chem_id))
+        if chem is None:
+            return False, "Chemical for this request no longer exists."
+
+        have = float(chem.amount or 0.0)
+        need = float(req.quantity or 0.0)
+
+        if need <= 0:
+            return False, "Requested quantity must be > 0."
+
+        if have < need:
+            return False, f"Not enough stock: have {have:g} {chem.unit}, requested {need:g} {chem.unit}."
+
+        chem.amount = have - need
+        req.status = "approved"
+        sess.commit()
+        return True, f"Approved. New stock for “{chem.name}”: {chem.amount:g} {chem.unit}."
+
 # =============================
 # Tiny utils (UX)
 # =============================
-CAS_HELP_URL = "https://commonchemistry.cas.org/"  # public CAS lookup index page
+CAS_HELP_URL = "https://commonchemistry.cas.org/"  # public CAS lookup
 
 def basic_email_ok(email: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip()))
@@ -513,21 +546,28 @@ Ethanol,1,L,Flammables Cabinet,96%"""
     if reqs:
         for rid, cname, qty, fname, sname, remail, status, created in reqs:
             with st.container(border=True):
-                st.write(f"**[{rid}] {cname}** — requested: **{qty}**")
+                st.write(f"**[{rid}] {cname}** — requested: **{qty:g}**")
                 st.write(f"Requester: {fname} {sname} ({remail}) • Created: {created} • Status: {status}")
+
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    if st.button("Approve", key=f"approve_{rid}"):
-                        set_request_status(rid, "approved")
-                        st.success("Approved.")
+                    if st.button("Approve & deduct stock", key=f"approve_{rid}"):
+                        ok, msg = approve_request_and_adjust(rid)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
                 with c2:
                     if st.button("Reject", key=f"reject_{rid}"):
                         set_request_status(rid, "rejected")
                         st.info("Rejected.")
+
                 with c3:
                     if st.button("Mark Fulfilled", key=f"fulfill_{rid}"):
+                        # No additional stock change here; approval already deducted.
                         set_request_status(rid, "fulfilled")
-                        st.success("Fulfilled.")
+                        st.success("Marked as fulfilled.")
     else:
         st.info("No pending in-stock requests.")
 
