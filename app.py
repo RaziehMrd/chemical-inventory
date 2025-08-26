@@ -18,7 +18,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, relationship
 
-
 # =============================
 # Config
 # =============================
@@ -53,7 +52,6 @@ def _normalize_db_url(url: str) -> str:
 
 DB_URL = _normalize_db_url(DB_URL)
 
-
 # =============================
 # SQLAlchemy models (2.x style)
 # =============================
@@ -77,9 +75,9 @@ class Request(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chem_id: Mapped[int] = mapped_column(ForeignKey("chemicals.id"), nullable=False)
 
-    # New columns (ensure they also exist in your existing DB via ALTER TABLE)
-    first_name: Mapped[str] = mapped_column(String, nullable=False, default="")  # NEW
-    surname: Mapped[str] = mapped_column(String, nullable=False, default="")     # NEW
+    # Ensure these columns exist in your existing DB (ALTER TABLE done earlier)
+    first_name: Mapped[str] = mapped_column(String, nullable=False, default="")
+    surname: Mapped[str] = mapped_column(String, nullable=False, default="")
 
     requester_email: Mapped[str] = mapped_column(String, nullable=False)
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
@@ -88,6 +86,27 @@ class Request(Base):
 
     chemical: Mapped[Chemical] = relationship(back_populates="requests")
 
+class PurchaseRequest(Base):
+    """
+    For "not found in search" purchases.
+    Required fields: material_name, cas_number, specifications, amount, unit
+    Optional: comments, requester_first_name, requester_surname, requester_email
+    """
+    __tablename__ = "purchase_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    material_name: Mapped[str] = mapped_column(String, nullable=False)
+    cas_number: Mapped[str] = mapped_column(String, nullable=False)
+    specifications: Mapped[str] = mapped_column(String, nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    unit: Mapped[str] = mapped_column(String, nullable=False)
+
+    comments: Mapped[str] = mapped_column(String, default="")  # optional
+    requester_first_name: Mapped[str] = mapped_column(String, default="")  # optional
+    requester_surname: Mapped[str] = mapped_column(String, default="")     # optional
+    requester_email: Mapped[str] = mapped_column(String, default="")       # optional
+
+    status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
 
 # =============================
 # Engine & table creation
@@ -98,7 +117,6 @@ if DB_URL.startswith("sqlite:"):
 
 engine = create_engine(DB_URL, echo=False, future=True, connect_args=connect_args, pool_pre_ping=True)
 Base.metadata.create_all(engine)
-
 
 # =============================
 # CRUD helpers
@@ -200,6 +218,83 @@ def set_request_status(req_id: int, new_status: str):
         req.status = new_status
         sess.commit()
 
+# --- Purchase request helpers
+def add_purchase_request(
+    material_name: str,
+    cas_number: str,
+    specifications: str,
+    amount: float,
+    unit: str,
+    comments: str = "",
+    requester_first_name: str = "",
+    requester_surname: str = "",
+    requester_email: str = "",
+):
+    with Session(engine) as sess:
+        pr = PurchaseRequest(
+            material_name=material_name.strip(),
+            cas_number=cas_number.strip(),
+            specifications=specifications.strip(),
+            amount=float(amount),
+            unit=unit.strip(),
+            comments=comments.strip(),
+            requester_first_name=requester_first_name.strip(),
+            requester_surname=requester_surname.strip(),
+            requester_email=requester_email.strip(),
+            status="pending",
+            created_at=datetime.utcnow(),
+        )
+        sess.add(pr)
+        sess.commit()
+
+def list_purchase_requests(status: str | None = None):
+    with Session(engine) as sess:
+        if status:
+            stmt = text("""
+                SELECT id,
+                       material_name,
+                       cas_number,
+                       specifications,
+                       amount,
+                       unit,
+                       requester_first_name,
+                       requester_surname,
+                       requester_email,
+                       comments,
+                       status,
+                       created_at
+                FROM purchase_requests
+                WHERE status = :status
+                ORDER BY id DESC
+            """)
+            rows = sess.execute(stmt, {"status": status}).all()
+        else:
+            stmt = text("""
+                SELECT id,
+                       material_name,
+                       cas_number,
+                       specifications,
+                       amount,
+                       unit,
+                       requester_first_name,
+                       requester_surname,
+                       requester_email,
+                       comments,
+                       status,
+                       created_at
+                FROM purchase_requests
+                ORDER BY id DESC
+            """)
+            rows = sess.execute(stmt).all()
+        return rows
+
+def set_purchase_request_status(req_id: int, new_status: str):
+    with Session(engine) as sess:
+        pr = sess.get(PurchaseRequest, int(req_id))
+        if pr is None:
+            return
+        pr.status = new_status
+        sess.commit()
 
 # =============================
 # UI
@@ -225,31 +320,99 @@ with tabs[0]:
     else:
         st.info("No chemicals match your search.")
 
-    st.markdown("---")
-    st.subheader("Request a chemical")
+        # -------- Request Purchase (appears only when search has no results) --------
+        st.markdown(
+            "<div style='margin-top: 1rem; font-weight:600;'>Request to purchase this material</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<span style='color:red;font-weight:700;'>★</span> Required fields", unsafe_allow_html=True)
 
-    chem_options = {f"{name} ({amount} {unit})": cid for cid, name, amount, unit, _loc in data} if data else {}
-    if not chem_options:
-        st.warning("No chemicals to request yet. Please ask an admin to add items.")
-    else:
-        with st.form("request_form"):
-            chosen = st.selectbox("Choose chemical", options=list(chem_options.keys()))
-            qty = st.number_input("Quantity needed", min_value=0.0, step=0.1, format="%.3f")
-            first_name = st.text_input("First Name")
-            surname = st.text_input("Surname")
-            email = st.text_input("Your email")
-            submitted = st.form_submit_button("Submit request")
+        req_tab_required, req_tab_optional = st.tabs(["Required ★", "Optional (Comments & Contact)"])
 
-        if submitted:
-            if qty <= 0:
-                st.error("Quantity must be > 0.")
-            elif not first_name.strip() or not surname.strip():
-                st.error("Please enter both first name and surname.")
-            elif "@" not in email or "." not in email:
-                st.error("Please enter a valid email.")
+        with req_tab_required:
+            with st.form("purchase_required_form", clear_on_submit=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    material_name = st.text_input("Material name ★")
+                    cas_number = st.text_input("CAS number ★", placeholder="e.g., 64-17-5")
+                    amount = st.number_input("Amount ★", min_value=0.0, step=0.1, format="%.3f")
+                with col2:
+                    specifications = st.text_area("Specifications ★", placeholder="Grade, purity, supplier preference, size, etc.", height=110)
+                    unit = st.selectbox("Unit ★", ["g", "mg", "kg", "mL", "L", "other"])
+
+                submit_required = st.form_submit_button("Continue to Optional")
+
+        with req_tab_optional:
+            with st.form("purchase_optional_form"):
+                comments = st.text_area("Comments (optional)", placeholder="Any extra details, budget code, delivery notes, etc.", height=100)
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    requester_first_name = st.text_input("First name (optional)")
+                with c2:
+                    requester_surname = st.text_input("Surname (optional)")
+                with c3:
+                    requester_email = st.text_input("Email (optional)")
+                submit_purchase = st.form_submit_button("Submit purchase request")
+
+        # Validate and submit (requires required form to be filled at least once)
+        if "material_name" in locals() and submit_purchase:
+            errs = []
+            if not material_name.strip():
+                errs.append("Material name")
+            if not cas_number.strip():
+                errs.append("CAS number")
+            if not specifications.strip():
+                errs.append("Specifications")
+            if amount <= 0:
+                errs.append("Amount")
+            if not unit:
+                errs.append("Unit")
+
+            if errs:
+                st.error("Please fill all required fields (★): " + ", ".join(errs))
             else:
-                add_request(chem_options[chosen], first_name, surname, email, qty)
-                st.success("Request submitted! The lab admin will review it.")
+                try:
+                    add_purchase_request(
+                        material_name=material_name,
+                        cas_number=cas_number,
+                        specifications=specifications,
+                        amount=amount,
+                        unit=unit,
+                        comments=comments if "comments" in locals() else "",
+                        requester_first_name=requester_first_name if "requester_first_name" in locals() else "",
+                        requester_surname=requester_surname if "requester_surname" in locals() else "",
+                        requester_email=requester_email if "requester_email" in locals() else "",
+                    )
+                    st.success("Purchase request submitted! The lab admin will review it.")
+                except Exception as e:
+                    st.error(f"Failed to submit purchase request: {e}")
+
+    # -------- Regular request flow (for in-stock chemicals) --------
+    if data:
+        st.markdown("---")
+        st.subheader("Request a chemical (in stock)")
+        chem_options = {f"{name} ({amount} {unit})": cid for cid, name, amount, unit, _loc in data} if data else {}
+        if not chem_options:
+            st.warning("No chemicals to request yet. Please ask an admin to add items.")
+        else:
+            with st.form("request_form"):
+                chosen = st.selectbox("Choose chemical", options=list(chem_options.keys()))
+                qty = st.number_input("Quantity needed", min_value=0.0, step=0.1, format="%.3f")
+                first_name = st.text_input("First Name")
+                surname = st.text_input("Surname")
+                email = st.text_input("Your email")
+                submitted = st.form_submit_button("Submit request")
+
+            if submitted:
+                if qty <= 0:
+                    st.error("Quantity must be > 0.")
+                elif not first_name.strip() or not surname.strip():
+                    st.error("Please enter both first name and surname.")
+                elif "@" not in email or "." not in email:
+                    st.error("Please enter a valid email.")
+                else:
+                    add_request(chem_options[chosen], first_name, surname, email, qty)
+                    st.success("Request submitted! The lab admin will review it.")
 
 # --- Admin
 with tabs[1]:
@@ -337,7 +500,8 @@ Ethanol,1,L,Flammables Cabinet,96%"""
                 except Exception as e:
                     st.error(f"Error updating stock: {e}")
 
-    st.markdown("### Pending requests")
+    # Pending in-stock requests
+    st.markdown("### Pending in-stock requests")
     reqs = list_requests(status="pending")
     if reqs:
         for rid, cname, qty, fname, sname, remail, status, created in reqs:
@@ -359,26 +523,59 @@ Ethanol,1,L,Flammables Cabinet,96%"""
                         set_request_status(rid, "fulfilled")
                         st.success("Fulfilled.")
     else:
-        st.info("No pending requests.")
+        st.info("No pending in-stock requests.")
 
-    st.markdown("### All requests")
-    all_reqs = list_requests()
-    if all_reqs:
+    # Purchase requests
+    st.markdown("### Pending purchase requests")
+    pending_purchases = list_purchase_requests(status="pending")
+    if pending_purchases:
+        for (pid, mname, cas, specs, amt, unit, pfname, psname, pmail, pcomments, pstatus, pcreated) in pending_purchases:
+            with st.container(border=True):
+                st.write(f"**[{pid}] {mname}** — {amt} {unit} • CAS: {cas}")
+                st.write(f"Specifications: {specs}")
+                contact = f"{(pfname + ' ' + psname).strip()} ({pmail})".strip() if (pfname or psname or pmail) else "—"
+                st.write(f"Requester: {contact} • Created: {pcreated} • Status: {pstatus}")
+                if pcomments:
+                    st.caption(f"Comments: {pcomments}")
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    if st.button("Approve purchase", key=f"papprove_{pid}"):
+                        set_purchase_request_status(pid, "approved")
+                        st.success("Purchase request approved.")
+                with c2:
+                    if st.button("Reject purchase", key=f"preject_{pid}"):
+                        set_purchase_request_status(pid, "rejected")
+                        st.info("Purchase request rejected.")
+                with c3:
+                    if st.button("Mark Purchased", key=f"pfulfill_{pid}"):
+                        set_purchase_request_status(pid, "purchased")
+                        st.success("Marked as purchased.")
+    else:
+        st.info("No pending purchase requests.")
+
+    st.markdown("### All purchase requests")
+    all_purchases = list_purchase_requests()
+    if all_purchases:
         st.dataframe(
             [
                 {
-                    "ID": rid,
-                    "Chemical": cname,
-                    "Qty": qty,
-                    "First Name": fname,
-                    "Surname": sname,
-                    "Requester": remail,
-                    "Status": status,
-                    "Created": str(created),
+                    "ID": pid,
+                    "Material": mname,
+                    "CAS": cas,
+                    "Specs": specs,
+                    "Amount": amt,
+                    "Unit": unit,
+                    "First Name": pfname,
+                    "Surname": psname,
+                    "Email": pmail,
+                    "Comments": pcomments,
+                    "Status": pstatus,
+                    "Created": str(pcreated),
                 }
-                for rid, cname, qty, fname, sname, remail, status, created in all_reqs
+                for (pid, mname, cas, specs, amt, unit, pfname, psname, pmail, pcomments, pstatus, pcreated) in all_purchases
             ],
             use_container_width=True,
         )
     else:
-        st.info("No requests yet.")
+        st.info("No purchase requests yet.")
